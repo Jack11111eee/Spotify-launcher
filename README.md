@@ -138,42 +138,45 @@ cat ~/Library/Logs/SpotifyLauncher.log
 
 ### 「歌变灰」的诊断记录
 
-**结论：跟这个启动器无关。问题在 Spotify 桌面客户端的本地状态。**
+**结论：跟这个启动器无关，是账号所属市场的问题。**
 
-2026-09-18 做过一次完整诊断（用 mitmproxy 拿到了 HTTP 层可见性）。先纠正两个流传下来的错误认知：
+2026-09-18 做过一次完整诊断（用 mitmproxy 拿到了 HTTP 层可见性）。
 
-- **不是「所有歌变灰」，是按专辑。** 灰掉的曲目全部来自 `太陽之子` 这一张（2026-03-25 发行）；2003 年的 `斷了的弦` 一直正常播放。别再用「全灰」描述它，那会把范围搞错。
-- **不是「音频 CDN 零连接」。** 音频 CDN 一直在正常工作 —— 实测下载过 3.8~5.7MB 的音频（`audio4-fa.scdn.co` 返回 `206`）。灰歌只是**走不到那一步**。
+**根因：账号的国家/地区是尼日利亚（NG）。** 从客户端的 `user-customization-service/v1/customize` 响应里直接读得到：
+
+```
+country_code      = "NG"
+financial-product = "pr:premium,tc:0,rt:v2_NG_default_new-family-sub-1m_0_NGN_default"
+name              = "Spotify Premium"
+multiuserplan-member-type = "FAMILY_MEMBER"
+```
+
+Spotify 的曲库授权**按国家给**。客户端只把账号所属市场有授权的曲目画成可播放；尼日利亚区曲库极小，周杰伦和绝大多数华语歌都不在其中 —— 于是整片变灰。
+
+**为什么以前能用**（推断，没有直接证据）：Spotify 允许 Premium 用户在境外使用约 14 天，期间按 IP 所在市场供曲。长期挂在境外节点上，窗口到期后市场被打回注册地 NG。这能解释「先灰一部分、后来全灰」的恶化过程。
 
 **已排除的层面：**
 
 | 层面 | 结论 | 证据 |
 |---|---|---|
-| 代理 / 节点 / 出口 IP | 正常 | 全程零绕行、零 4xx/5xx |
+| 代理 / 节点 / 出口 IP | 正常 | 全程零绕行、零 4xx/5xx；换节点（美国 DMIT → 美国住宅）无任何变化 |
 | 音频 CDN | 正常 | `206`，实测下载 3.8~5.7MB |
 | DRM | 正常 | `widevine-license` 返回 `200` |
-| 曲目授权 / 市场 | 正常 | `metadata/4/track` 在 `from_token/NG/US/TW/JP/HK` **六个市场全部 200**，且带完整 `original_audio` 句柄和封面 |
-| 发行时间门控 | 排除 | `earliest_live_timestamp` 是 2026-03-25，早已过去 |
+| 曲目元数据 / 服务端授权 | 排除 | `metadata/4/track` 在 `from_token/NG/US/TW/JP/HK` **六个市场全部 200**，带完整 `original_audio` 句柄和封面 |
+| 发行时间门控 | 排除 | `earliest_live_timestamp` 早已过去 |
 | HTTP 缓存投毒 | 排除 | Chromium 缓存里没有任何相关条目 |
+| `ap-*.spotify.com` 不可达 | **无关** | 这批接入点在全球范围内都已下线（6 个国家的探测点，80/443 全部超时），但客户端根本不用它们 —— 它走 `guc3-spclient` / `dealer` |
 
-**决定性的一步是网页版对照**：同一账号、同一代理、同一出口 IP，浏览器打开 `open.spotify.com` 播放 `太陽之子`，**走完了整条链路**：
+桌面版对灰掉的歌**连请求都不发** —— 点击时抓包日志零新增，弹的「无法获取此内容」是纯客户端行为：它本地就已经判定这些曲目在当前市场不可用，所以没有可发的请求。所以第五态（没连着代理就重启）**永远不会触发** —— Spotify 从头到尾都连着代理。
 
-```
-200  GET   /metadata/4/track/<gid>?market=from_token     ← 拿到元数据
-200  GET   /storage-resolve/v2/files/audio/...           ← 拿到音频地址
-200  POST  /widevine-license/v1/audio/license            ← 拿到 DRM 密钥
-```
+**试过但没有用的修复：**
 
-而桌面版对同一首歌**连请求都不发** —— 点击时抓包日志零新增，弹的「无法获取此内容」是纯客户端行为。桌面版里唯一看得见的异常是：CORS 预检 `OPTIONS` 发出去了（`200`），正式的 `GET` **从来没发**。
+- 清 `~/Library/Caches/com.spotify.client/`（700MB）→ **无效**。跟缓存无关。
+- 换出口节点 → **无效**。问题不在网络层。
+- 移走 `~/Library/Application Support/Spotify/PersistentCache/` → **无效**。**并且更正一处早先写错的结论**：当时判断它「有害」，理由是移走后 `/api/token` 一直返回 `400`。实测那 400 是 **DPoP 协议的正常握手**（响应体是 `{"error":"use_dpop_nonce"}`），客户端带 nonce 重发随即 `200`。那不是故障。
+- **退出登录 → 重新登录**（早先这里推荐过）→ **不要做。** 它会把客户端卡在登录页，报 `accesspoint:34`。登录页上「防火墙可能正在拦截 Spotify」那句提示是误导 —— 网络完全正常，那是客户端本地状态的问题（那次是浏览器 OAuth 其实已经走通、令牌也拿到了，界面没跟上，重启一次即恢复）。
 
-所以第五态（没连着代理就重启）**永远不会触发** —— Spotify 从头到尾都连着代理。
-
-**试过但不要做的修复：**
-
-- 清 `~/Library/Caches/com.spotify.client/`（700MB）→ **无效**。灰歌依旧，桌面版仍不请求它们的 gid。
-- 移走 `~/Library/Application Support/Spotify/PersistentCache/` → **有害。** 它不只存缓存，还存认证链路要用的东西；移走后 `/api/token` 会一直 `400`（登录能过、授权能过，但拿不到 access token），客户端等于废掉。已实测并回滚。
-
-**建议的下一步**：用应用自己的**退出登录 → 重新登录**（右上角头像 → 退出登录）重置账号态。这是官方支持的路径，不会像删目录那样把认证链路弄断。
+**真正的修复**：把账号的国家/地区改成实际所在地区（[spotify.com/account](https://www.spotify.com/account) → 编辑个人资料）。Spotify 限制**每 14 天只能改一次**；Premium 改区通常需要**新地区的付款方式**。
 
 **怎么抓这一层。** mihomo 只记 TCP 连接，`tools/spotify-proxy-watch.sh` 只看得见连接断没断，**两者都看不到 HTTP 状态码**（CDN 返回 403 和 200 在它们眼里一样）。要看 HTTP 层，把 mitmproxy 串在 Clash 前面：
 
