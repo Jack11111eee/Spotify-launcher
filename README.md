@@ -138,47 +138,94 @@ cat ~/Library/Logs/SpotifyLauncher.log
 
 ### 「歌变灰」的诊断记录
 
-**结论：跟这个启动器无关，是账号所属市场的问题。**
+**结论：桌面客户端本地缓存了错误的「不可用」元数据，而且不会自我纠正。跟这个启动器、代理、网络、账号市场都无关。**
 
-2026-09-18 做过一次完整诊断（用 mitmproxy 拿到了 HTTP 层可见性）。
+2026-09-18 做了一次完整诊断，最终定位到这一层。
 
-**根因：账号的国家/地区是尼日利亚（NG）。** 从客户端的 `user-customization-service/v1/customize` 响应里直接读得到：
+#### 现象
+
+- 桌面版里大量曲目变灰、点不动，点了弹「无法获取此内容」
+- 起初只是按专辑（《太陽之子》），后来扩散到几乎全部
+- 同一账号、同一代理、同一出口 IP，**网页版 `open.spotify.com` 能正常播放**
+- 当天还伴随一次登录故障（与灰歌无关，见文末）
+
+#### 根因
+
+客户端把曲目的可用性**缓存在本地**，之后用条件请求（`If-None-Match` / `If-Modified-Since`）去校验。服务端返回 `304 Not Modified` 时，它就继续沿用本地那份数据。
+
+**一旦缓存里被写进了「不可用」，它不会再重新问一次。** 重启客户端也没用 —— 缓存是持久化的，重启只是把它读回来。
+
+这也解释了最反常的那个现象：桌面版对灰掉的歌**连请求都不发**（抓包里只有 CORS 预检 `OPTIONS`，没有正式 `GET`）。不是它不想请求，是它认为本地已经有答案了。
+
+**缓存最初为什么会被写成「不可用」，没有拿到直接证据** —— 坏掉的那份状态在修复过程中被就地覆盖了。最可能的两个方向（均为推测）：某次元数据请求失败（网络抖动 / 5xx / 超时）被当成了「不可用」；或账号状态在那段时间短暂异常，客户端据此缓存了不可用，之后账号恢复却不重取。
+
+#### 怎么定位到的
+
+把 mitmproxy 串在 Clash 前面，并在插件里**摘掉 `/metadata/4/` 请求上的条件请求头**，逼服务端返回完整的 `200` 而不是 `304`。桌面版当场恢复：
 
 ```
-country_code      = "NG"
-financial-product = "pr:premium,tc:0,rt:v2_NG_default_new-family-sub-1m_0_NGN_default"
-name              = "Spotify Premium"
-multiuserplan-member-type = "FAMILY_MEMBER"
+22:48:56  desktop  GET   /metadata/4/track/...                    200
+22:48:56  desktop  GET   /storage-resolve/v2/files/audio/...      200
+22:48:56  desktop  POST  /playplay/v1/key/...                     200
+22:48:57  desktop  206   audio4-fa.scdn.co/audio/...          3145728B
+22:49:04  desktop  206   audio4-fa.scdn.co/audio/...          4550832B
 ```
 
-Spotify 的曲库授权**按国家给**。客户端只把账号所属市场有授权的曲目画成可播放；尼日利亚区曲库极小，周杰伦和绝大多数华语歌都不在其中 —— 于是整片变灰。
+随后把 mitmproxy 撤掉、用 `./launcher.sh` 恢复正常启动，**依然正常** —— 证明坏的就是那份缓存，刷新一次即可，不需要常驻中间层。
 
-**为什么以前能用**（推断，没有直接证据）：Spotify 允许 Premium 用户在境外使用约 14 天，期间按 IP 所在市场供曲。长期挂在境外节点上，窗口到期后市场被打回注册地 NG。这能解释「先灰一部分、后来全灰」的恶化过程。
+#### 试过的办法
 
-**已排除的层面：**
+| 办法 | 结果 | 原因 |
+|---|---|---|
+| 重启客户端 | 无效 | 缓存持久化，重启只是读回来 |
+| 清 `~/Library/Caches/com.spotify.client/`（700MB） | 无效 | 曲目元数据不在那儿（清掉后灰歌依旧） |
+| 换出口节点（美国 DMIT → 美国住宅） | 无效 | 与网络层无关 |
+| 退出登录 → 重新登录 | **有害** | 与缓存是两回事，而且会把客户端卡在登录页（见文末） |
+| 移走 `Application Support/Spotify/PersistentCache/` | 无效 | 灰歌依旧。**但早先「它有害」的判断是错的**，见下面的「两处被证伪的结论」 |
+
+#### 已排除的层面
 
 | 层面 | 结论 | 证据 |
 |---|---|---|
-| 代理 / 节点 / 出口 IP | 正常 | 全程零绕行、零 4xx/5xx；换节点（美国 DMIT → 美国住宅）无任何变化 |
-| 音频 CDN | 正常 | `206`，实测下载 3.8~5.7MB |
+| 代理 / 节点 / 出口 IP | 正常 | 全程零绕行、零 4xx/5xx；换节点无任何变化 |
+| 音频 CDN | 正常 | `206`，实测下载 3.1~4.6MB |
 | DRM | 正常 | `widevine-license` 返回 `200` |
-| 曲目元数据 / 服务端授权 | 排除 | `metadata/4/track` 在 `from_token/NG/US/TW/JP/HK` **六个市场全部 200**，带完整 `original_audio` 句柄和封面 |
+| 服务端授权 / 市场 | 排除 | `metadata/4/track` 在 `from_token/NG/US/TW/JP/HK` **六个市场全部 200**，带完整 `original_audio` 句柄和封面 |
 | 发行时间门控 | 排除 | `earliest_live_timestamp` 早已过去 |
-| HTTP 缓存投毒 | 排除 | Chromium 缓存里没有任何相关条目 |
+| Chromium HTTP 缓存 | 排除 | `~/Library/Caches/com.spotify.client/` 里没有任何相关条目，清掉也没用。坏的是**另一份**缓存（见上面的「根因」） |
 | `ap-*.spotify.com` 不可达 | **无关** | 这批接入点在全球范围内都已下线（6 个国家的探测点，80/443 全部超时），但客户端根本不用它们 —— 它走 `guc3-spclient` / `dealer` |
 
-桌面版对灰掉的歌**连请求都不发** —— 点击时抓包日志零新增，弹的「无法获取此内容」是纯客户端行为：它本地就已经判定这些曲目在当前市场不可用，所以没有可发的请求。所以第五态（没连着代理就重启）**永远不会触发** —— Spotify 从头到尾都连着代理。
+顺带一条：启动器的第五态（没连着代理就重启）**在这个故障里永远不会触发** —— Spotify 从头到尾都连着代理，重启也修不好。
 
-**试过但没有用的修复：**
+#### 两处被证伪的结论
 
-- 清 `~/Library/Caches/com.spotify.client/`（700MB）→ **无效**。跟缓存无关。
-- 换出口节点 → **无效**。问题不在网络层。
-- 移走 `~/Library/Application Support/Spotify/PersistentCache/` → **无效**。**并且更正一处早先写错的结论**：当时判断它「有害」，理由是移走后 `/api/token` 一直返回 `400`。实测那 400 是 **DPoP 协议的正常握手**（响应体是 `{"error":"use_dpop_nonce"}`），客户端带 nonce 重发随即 `200`。那不是故障。
-- **退出登录 → 重新登录**（早先这里推荐过）→ **不要做。** 它会把客户端卡在登录页，报 `accesspoint:34`。登录页上「防火墙可能正在拦截 Spotify」那句提示是误导 —— 网络完全正常，那是客户端本地状态的问题（那次是浏览器 OAuth 其实已经走通、令牌也拿到了，界面没跟上，重启一次即恢复）。
+诊断过程中走过两条弯路，都留在这里，免得以后重蹈：
 
-**真正的修复**：把账号的国家/地区改成实际所在地区（[spotify.com/account](https://www.spotify.com/account) → 编辑个人资料）。Spotify 限制**每 14 天只能改一次**；Premium 改区通常需要**新地区的付款方式**。
+1. **「根因是账号市场」——错。** 中途根据客户端 `customize` 响应里的 `country_code = "NG"`（尼日利亚区家庭组 Premium）判断「尼日利亚曲库小所以全灰」。但后续抓到 **46 次** `extended-metadata` 请求，`country` 全程都是 `NG`，**包括它正常播放音频的那几次**。country 与「歌变灰」同时存在，但互不相干。
+2. **「移走 `PersistentCache` 有害」——错。** 早先这里写着它会让 `/api/token` 持续 `400`。实测那个 `400` 是 **DPoP 协议的正常握手**：服务端回 `{"error":"use_dpop_nonce"}` 并附上 nonce，客户端带上 nonce 重发随即 `200`。同一个请求连发两次、第一次 400 第二次 200，是设计如此，不是故障。
 
-**怎么抓这一层。** mihomo 只记 TCP 连接，`tools/spotify-proxy-watch.sh` 只看得见连接断没断，**两者都看不到 HTTP 状态码**（CDN 返回 403 和 200 在它们眼里一样）。要看 HTTP 层，把 mitmproxy 串在 Clash 前面：
+#### 下次再犯怎么办
+
+**已知有效的办法**就是上面那条：把 mitmproxy 串上去，在插件里摘掉 `/metadata/4/` 的条件请求头，让它重新拉一次。刷一次之后就可以撤掉 mitmproxy，用 `./launcher.sh` 恢复正常启动 —— 实测刷新是持久的，不需要常驻中间层。
+
+**还没找到不依赖 mitmproxy 的等效办法。** 试过的两条都不行：
+
+- 清 `~/Library/Caches/com.spotify.client/`（700MB）→ 无效
+- 移走 `Application Support/Spotify/PersistentCache/` → 无效
+
+也就是说，那份坏掉的曲目可用性缓存**具体落在哪个文件里，目前还不清楚**。下次复现时**先把坏掉的状态整份备份下来再动手修**（这次没来得及，坏状态在修复过程中被就地覆盖了），两相对照就能定位到文件。
+
+#### 附：同一天遇到的登录故障（与灰歌无关）
+
+- **症状**：客户端卡在登录页，报 `accesspoint:34`，界面提示「防火墙可能正在拦截 Spotify」
+- **排查**：网络完全正常 —— 登录需要的每条链路都通（`login5/v3/login` 200、`oauth2/device/authorize` 200、`/api/token` 200），那句防火墙提示是误导
+- **真正原因**：客户端本地状态没跟上。浏览器 OAuth 其实已经走通、访问令牌也拿到了，但界面仍停在登录页
+- **解决**：重启客户端即恢复
+- **教训**：**不要点「退出登录」** —— 它会把客户端卡在登录页
+
+### 怎么抓这一层
+
+mihomo 只记 TCP 连接，`tools/spotify-proxy-watch.sh` 只看得见连接断没断，**两者都看不到 HTTP 状态码**（CDN 返回 403 和 200 在它们眼里一样）。要看 HTTP 层，把 mitmproxy 串在 Clash 前面：
 
 ```bash
 mitmdump --mode upstream:http://127.0.0.1:59062 -p 8888
@@ -186,6 +233,21 @@ open -a Spotify --args "--proxy-server=http://127.0.0.1:8888" "--ignore-certific
 ```
 
 `--ignore-certificate-errors` 是这里的关键：Spotify 是 CEF 内核，这个 Chromium 开关让它直接接受 mitmproxy 的自签证书，**不需要往系统钥匙串装 CA**，全程不改 macOS 系统设置。测完退出 Spotify，用 `./launcher.sh` 重新拉起即可回到正常方式。
+
+**这个故障就藏在一个细节里**：默认抓包看到的是一片 `304 Not Modified`，看上去「一切正常」。要看到真相，得在插件里把 `/metadata/4/` 请求上的条件请求头摘掉，逼服务端返回完整正文：
+
+```python
+def request(flow):
+    if "/metadata/4/" in flow.request.path:
+        for h in ("if-none-match", "if-modified-since"):
+            flow.request.headers.pop(h, None)
+```
+
+摘掉之后客户端立刻恢复播放 —— **「摘掉就好」本身就是诊断结论**：它一直在拿 304、一直在用本地那份错数据。
+
+另一个识别技巧：日志里带上客户端源端口，再用 `lsof -nP -iTCP` 把端口对回进程，就能分清哪条请求来自桌面版、哪条来自浏览器 —— 两者都会请求 `spclient` / `pathfinder`，光看主机名分不开。
+
+### 连接监视脚本
 
 ```bash
 tools/spotify-proxy-watch.sh &                    # 启动
