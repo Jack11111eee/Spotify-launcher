@@ -19,6 +19,19 @@ open -a Spotify --args --proxy-server=http://127.0.0.1:59062
 
 生成 `/Applications/Spotify (代理).app`。
 
+### 图标
+
+图标由 `icon/make_icon.py` 生成，底图直接取自本机 Spotify 的真实图标，只在右下角加一枚绕行徽标。需要 python3 + Pillow。
+
+```bash
+python3 icon/make_icon.py     # 生成 icon/SpotifyProxy.icns
+./build.sh                    # 构建时若发现没有图标，会自动生成一份
+```
+
+网格不是照抄模板，是量出来的：把 Spotify 图标的 alpha 通道和超椭圆做拟合，`n=5.0` 时 IoU 0.9952，图形主体 824/1024、四周留白 100px。徽标按档位单独调——大尺寸画得出绕行箭头，小尺寸留不住细节就退化成纯圆点，16px 干脆不加，因为那个尺寸下任何徽标都会糊成像是渲染瑕疵的黑点。
+
+生成的 `.icns` 不会提交（底图是 Spotify 的美术资源），随时可以重新生成。
+
 ## 使用
 
 双击 `Spotify (代理).app` 即可，逻辑有三态：

@@ -7,3 +7,10 @@ AGENTS.md
 
 # macOS
 .DS_Store
+
+# Python
+__pycache__/
+
+# 生成的图标：底图取自 Spotify 自家图标，不适合提交到公开仓库
+# 用 python3 icon/make_icon.py 随时可以重新生成
+icon/*.icns
