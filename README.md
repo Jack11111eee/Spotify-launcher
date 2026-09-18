@@ -133,3 +133,18 @@ cat ~/Library/Logs/SpotifyLauncher.log
 ```
 
 直接跑 `./launcher.sh` 时不会写这个文件，输出就在终端里。
+
+### 抓「歌全变灰」的现场（临时诊断）
+
+睡眠唤醒后歌全变灰的**根因还没找到**。已确认的是：这台机器在电池上每十几分钟 DarkWake 一次（每次只持续 2–19 秒），唤醒瞬间到代理节点的路由不通，Spotify 走代理的连接会成批失败 —— 但实测它自己会在几秒内重连，所以「界面为什么一直灰着」还没有解释。
+
+`tools/spotify-proxy-watch.sh` 用来抓下一次复现时的现场：
+
+```bash
+tools/spotify-proxy-watch.sh &                    # 启动
+kill "$(cat /tmp/spotify-proxy-watch.pid)"        # 停止
+```
+
+日志在 `~/Library/Logs/spotify-proxy-watch.log`。只在 Spotify 运行时才探测（15 秒一次），只在**状态变化**（代理通→不通、Spotify 连着→断开）和**睡眠唤醒后**记录，另有约 5 分钟一次的心跳。看到 `proxy=ok(...)` 配 `sp_conn=0` 的那一行，就是复现现场。
+
+这是个临时工具，根因找到后连同这段一起删掉。
