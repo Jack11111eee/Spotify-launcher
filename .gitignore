@@ -1,0 +1,9 @@
+# 本地工作文件，不提交（此仓库为 public）
+# 说明文档里含订阅标识，CLAUDE.md 为本地 agent 指令
+Spotify代理启动器-构建说明.md
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# macOS
+.DS_Store
