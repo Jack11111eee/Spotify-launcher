@@ -54,7 +54,7 @@ python3 icon/make_icon.py     # 生成 icon/SpotifyProxy.icns
 
 最后一条状态是防御性的：光看命令行参数看不出连接是不是真的还在，所以启动器会去查 Spotify 的网络子进程是不是还连着代理端口，没连着就重启一次。
 
-**但它治不了「歌全变灰」。** 实测过一次灰屏现场：Spotify 一直连着代理（`sp_conn` 7~15，从未断开）、代理探测也通、mihomo 日志里没有任何错误 —— 界面却全是灰的，而且重启 Spotify 也修不好。那个故障不在这一层，详见下面的诊断记录。
+**但它治不了「歌变灰」。** 实测过灰屏现场：Spotify 一直连着代理（`sp_conn` 7~15，从未断开）、代理探测也通、mihomo 日志里没有任何错误 —— 界面却灰了，而且重启 Spotify 也修不好。那个故障不在这一层，详见下面的诊断记录。
 
 > **首次重启 Spotify 时** macOS 会弹一次「"Spotify (代理)" 想要控制 "Spotify"」，需要点允许（系统设置 → 隐私与安全性 → 自动化）。
 > 如果拒绝了这个授权，启动器就没法正常退出 Spotify，每次重启都会卡到超时兜底路径。
@@ -136,25 +136,57 @@ cat ~/Library/Logs/SpotifyLauncher.log
 
 直接跑 `./launcher.sh` 时不会写这个文件，输出就在终端里。
 
-### 抓「歌全变灰」的现场（临时诊断）
+### 「歌变灰」的诊断记录
 
-睡眠唤醒后歌全变灰的**根因仍未找到，但网络层已经排除**。2026-09-18 抓到过一次完整现场：Spotify 于 18:46:32 重启、带对了 `--proxy-server`，到 18:50 界面已全是灰的（弹「无法获取此内容」）。同一时刻：
+**结论：跟这个启动器无关。问题在 Spotify 桌面客户端的本地状态。**
 
-- 代理探测 `200` / 0.72s，出口 IP 美国加州
-- 网络子进程 12 条连接**全部**指向代理端口，零绕行
-- mihomo 日志里所有请求都命中规则、走节点，**无一条错误**；API 端点 42 次请求，音频 CDN 只被请求 1 次
-- 10 秒窗口内，所有 Spotify 连接**移动 0 字节**
-- 监视器 5 次采样 `sp_conn` 一直是 7~15，**从未断开**
+2026-09-18 做过一次完整诊断（用 mitmproxy 拿到了 HTTP 层可见性）。先纠正两个流传下来的错误认知：
 
-**重启 Spotify 修不好它**（18:46 那次重启后依旧全灰）。所以第五态（没连着代理就重启）**永远不会触发** —— Spotify 从头到尾都连着代理。这个故障不在启动器能管的那一层。
+- **不是「所有歌变灰」，是按专辑。** 灰掉的曲目全部来自 `太陽之子` 这一张（2026-03-25 发行）；2003 年的 `斷了的弦` 一直正常播放。别再用「全灰」描述它，那会把范围搞错。
+- **不是「音频 CDN 零连接」。** 音频 CDN 一直在正常工作 —— 实测下载过 3.8~5.7MB 的音频（`audio4-fa.scdn.co` 返回 `206`）。灰歌只是**走不到那一步**。
 
-失败发生在 HTTP 层：Spotify 不是请求失败，而是**不再去取音频**。`tools/spotify-proxy-watch.sh` 只看得见 TCP 连接、**看不见 HTTP 状态码**（CDN 返回 403 和返回 200 在它眼里一样），所以它抓不到本故障，只适合排查「连接断没断」这一类问题。
+**已排除的层面：**
 
-账号地区是 Nigeria、出口 IP 在美国 —— 这个不匹配是已知事实，但**没验证过它是不是原因**（Spotify 的地区策略未能核实）。能把它和「机房 IP 被判定成代理」分开的测试：把 `🚀 节点选择` 切到 `🇺🇸 Unite States | Residential #VLESS`（住宅 IP，同国家不同 IP 性质）再试播放。**这个测试仍未做。**
+| 层面 | 结论 | 证据 |
+|---|---|---|
+| 代理 / 节点 / 出口 IP | 正常 | 全程零绕行、零 4xx/5xx |
+| 音频 CDN | 正常 | `206`，实测下载 3.8~5.7MB |
+| DRM | 正常 | `widevine-license` 返回 `200` |
+| 曲目授权 / 市场 | 正常 | `metadata/4/track` 在 `from_token/NG/US/TW/JP/HK` **六个市场全部 200**，且带完整 `original_audio` 句柄和封面 |
+| 发行时间门控 | 排除 | `earliest_live_timestamp` 是 2026-03-25，早已过去 |
+| HTTP 缓存投毒 | 排除 | Chromium 缓存里没有任何相关条目 |
+
+**决定性的一步是网页版对照**：同一账号、同一代理、同一出口 IP，浏览器打开 `open.spotify.com` 播放 `太陽之子`，**走完了整条链路**：
+
+```
+200  GET   /metadata/4/track/<gid>?market=from_token     ← 拿到元数据
+200  GET   /storage-resolve/v2/files/audio/...           ← 拿到音频地址
+200  POST  /widevine-license/v1/audio/license            ← 拿到 DRM 密钥
+```
+
+而桌面版对同一首歌**连请求都不发** —— 点击时抓包日志零新增，弹的「无法获取此内容」是纯客户端行为。桌面版里唯一看得见的异常是：CORS 预检 `OPTIONS` 发出去了（`200`），正式的 `GET` **从来没发**。
+
+所以第五态（没连着代理就重启）**永远不会触发** —— Spotify 从头到尾都连着代理。
+
+**试过但不要做的修复：**
+
+- 清 `~/Library/Caches/com.spotify.client/`（700MB）→ **无效**。灰歌依旧，桌面版仍不请求它们的 gid。
+- 移走 `~/Library/Application Support/Spotify/PersistentCache/` → **有害。** 它不只存缓存，还存认证链路要用的东西；移走后 `/api/token` 会一直 `400`（登录能过、授权能过，但拿不到 access token），客户端等于废掉。已实测并回滚。
+
+**建议的下一步**：用应用自己的**退出登录 → 重新登录**（右上角头像 → 退出登录）重置账号态。这是官方支持的路径，不会像删目录那样把认证链路弄断。
+
+**怎么抓这一层。** mihomo 只记 TCP 连接，`tools/spotify-proxy-watch.sh` 只看得见连接断没断，**两者都看不到 HTTP 状态码**（CDN 返回 403 和 200 在它们眼里一样）。要看 HTTP 层，把 mitmproxy 串在 Clash 前面：
+
+```bash
+mitmdump --mode upstream:http://127.0.0.1:59062 -p 8888
+open -a Spotify --args "--proxy-server=http://127.0.0.1:8888" "--ignore-certificate-errors"
+```
+
+`--ignore-certificate-errors` 是这里的关键：Spotify 是 CEF 内核，这个 Chromium 开关让它直接接受 mitmproxy 的自签证书，**不需要往系统钥匙串装 CA**，全程不改 macOS 系统设置。测完退出 Spotify，用 `./launcher.sh` 重新拉起即可回到正常方式。
 
 ```bash
 tools/spotify-proxy-watch.sh &                    # 启动
 kill "$(cat /tmp/spotify-proxy-watch.pid)"        # 停止
 ```
 
-日志在 `~/Library/Logs/spotify-proxy-watch.log`。只在 Spotify 运行时探测（15 秒一次），只在状态变化和唤醒后记录，另有约 5 分钟一次心跳。
+日志在 `~/Library/Logs/spotify-proxy-watch.log`。只在 Spotify 运行时探测（15 秒一次），只在状态变化和唤醒后记录，另有约 5 分钟一次心跳。它排查「连接断没断」有用，但抓不到上面这个故障。
