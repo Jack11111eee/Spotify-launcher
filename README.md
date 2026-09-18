@@ -179,7 +179,7 @@ cat ~/Library/Logs/SpotifyLauncher.log
 |---|---|---|
 | 重启客户端 | 无效 | 缓存持久化，重启只是读回来 |
 | 清 `~/Library/Caches/com.spotify.client/`（700MB） | 无效 | 曲目元数据不在那儿（清掉后灰歌依旧） |
-| 换出口节点（美国 DMIT → 美国住宅） | 无效 | 与网络层无关 |
+| 换出口节点（两个不同的美国节点） | 无效 | 与网络层无关 |
 | 退出登录 → 重新登录 | **有害** | 与缓存是两回事，而且会把客户端卡在登录页（见文末） |
 | 移走 `Application Support/Spotify/PersistentCache/` | 无效 | 灰歌依旧。**但早先「它有害」的判断是错的**，见下面的「两处被证伪的结论」 |
 
