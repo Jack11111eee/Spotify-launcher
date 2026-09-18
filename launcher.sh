@@ -5,9 +5,13 @@
 # 既不需要开 TUN 模式，也不占用 macOS 系统代理。
 #
 # 参数只在启动时生效，所以必须保证每次都是本脚本拉起 Spotify：
-#   - Spotify 未运行            -> 带参数启动
-#   - 在运行且已带参数          -> 只激活窗口
-#   - 在运行但没带参数（或端口变了）-> 退出后用参数重启
+#   - Spotify 未运行                      -> 带参数启动
+#   - 在运行，已带参数，代理通，也确实连着代理 -> 只激活窗口
+#   - 在运行，但没带参数（或端口变了）        -> 退出后用参数重启
+#   - 在运行，已带参数，但代理不通            -> 不重启（重启也没用），提示先修好 Clash
+#   - 在运行，已带参数，代理也通，但没连着代理 -> 退出后用参数重启
+#     睡眠唤醒时节点会短暂不可达，Spotify 的连接断了之后自己不会重建，表现就是歌全变灰，
+#     只有重启才能恢复；光看命令行参数是看不出这种坏掉的。
 #
 # 直接运行即可（./launcher.sh），也可由同目录的 .app 调用。详见 README.md。
 
@@ -15,6 +19,10 @@ set -uo pipefail
 
 CLASH_DIR="${CLASH_DIR:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 VERGE_YAML="$CLASH_DIR/verge.yaml"
+
+# 代理连通性探测用的地址。必须挑一个会走代理（非中国）的域名，
+# 否则探到的是直连，测不出代理本身通不通。
+PROBE_URL="https://apresolve.spotify.com/"
 
 # 从 Clash Verge 配置读取 mixed-port；读不到返回 1
 read_mixed_port() {
@@ -34,25 +42,70 @@ spotify_command() {
   ps -o command= -p "$pid" 2>/dev/null
 }
 
+# 把 ps 的 etime（[[dd-]hh:]mm:ss）换算成秒
+elapsed_seconds() {
+  printf '%s\n' "$1" | tr -d ' ' | awk -F'[-:]' '
+    NF == 4 { print $1*86400 + $2*3600 + $3*60 + $4; next }
+    NF == 3 { print $1*3600 + $2*60 + $3; next }
+    NF == 2 { print $1*60 + $2 }
+  '
+}
+
+# Spotify 是否真的连着代理端口；$1 = 代理端口
+# 判断不了的情况一律当作「连着」，免得无谓地重启。
+spotify_connected() {
+  local pid net started conns
+  pid=$(pgrep -x Spotify 2>/dev/null | head -n1)
+  [ -n "$pid" ] || return 0
+
+  # 刚起来这一分钟里可能还没建连，不判断
+  started=$(elapsed_seconds "$(ps -o etime= -p "$pid" 2>/dev/null)")
+  if [ -n "$started" ] && [ "$started" -lt 60 ]; then
+    return 0
+  fi
+
+  # 出网连接属于 Spotify 的网络服务子进程，不在主进程上
+  net=$(pgrep -P "$pid" -f 'utility-sub-type=network.mojom.NetworkService' 2>/dev/null | head -n1)
+  [ -n "$net" ] || return 0
+
+  # 不用管道接 grep：grep -q 提前退出会给 lsof 发 SIGPIPE，
+  # 在 pipefail 下整个管道会返回非 0，把「连着」误判成「没连着」。
+  conns=$(lsof -nP -a -p "$net" -iTCP 2>/dev/null)
+  case "$conns" in
+    *"->127.0.0.1:$1 (ESTABLISHED)"*) return 0 ;;
+  esac
+  return 1
+}
+
 # 从命令行里取出 --proxy-server 的值；没有则输出空
 proxy_arg_of() {
   printf '%s\n' "$1" | tr ' ' '\n' | grep -m1 '^--proxy-server=' | cut -d= -f2-
 }
 
-# 三态判断：$1 = Spotify 命令行（空表示未运行），$2 = 期望的 --proxy-server 值
+# 该做什么：
+#   $1 = Spotify 命令行（空表示未运行）
+#   $2 = 期望的 --proxy-server 值
+#   $3 = 代理是否可用（1/0）
+#   $4 = Spotify 是否已连上代理（1/0）
 decide_action() {
   if [ -z "$1" ]; then
     printf 'start\n'
-  elif [ "$(proxy_arg_of "$1")" = "$2" ]; then
+  elif [ "$(proxy_arg_of "$1")" != "$2" ]; then
+    printf 'restart\n'
+  elif [ "$3" != 1 ]; then
+    printf 'blocked\n'
+  elif [ "$4" = 1 ]; then
     printf 'activate\n'
   else
     printf 'restart\n'
   fi
 }
 
-# 代理端口是否有人监听
-port_open() {
-  nc -z -G 1 -w 1 127.0.0.1 "$1" >/dev/null 2>&1
+# 通过代理真的发一次请求；通了返回 0
+# 只看端口有没有人在监听是不够的：节点挂了的时候 mihomo 照样监听、
+# 照样接受连接，然后在往上连的时候失败。
+proxy_works() {
+  curl -s -o /dev/null --max-time 5 -x "$1" "$PROBE_URL" >/dev/null 2>&1
 }
 
 # 启动后确认参数真的生效了 —— open --args 对已在运行的实例会被静默忽略
@@ -102,22 +155,33 @@ quit_spotify() {
 }
 
 main() {
-  local port url action
+  local port url action proxy_ok connected
   if ! port=$(read_mixed_port); then
     notify "读不到 Clash Verge 的 mixed-port（${VERGE_YAML}）。请确认 Clash Verge 已安装并至少启动过一次。"
     exit 1
   fi
   url="http://127.0.0.1:$port"
 
-  if ! port_open "$port"; then
-    confirm "Clash 代理端口 $port 无响应，Clash Verge 可能没在运行。现在启动 Spotify 会完全连不上网。" || exit 0
-  fi
+  proxy_ok=0
+  proxy_works "$url" && proxy_ok=1
 
-  action=$(decide_action "$(spotify_command)" "$url")
+  connected=0
+  spotify_connected "$port" && connected=1
+
+  action=$(decide_action "$(spotify_command)" "$url" "$proxy_ok" "$connected")
 
   if [ "$action" = activate ]; then
     open -a Spotify
     return 0
+  fi
+
+  if [ "$action" = blocked ]; then
+    notify "Spotify 在运行，但代理 $url 不通，它现在连不上网。请先把 Clash Verge 弄通，再点一次启动器。"
+    exit 1
+  fi
+
+  if [ "$proxy_ok" -eq 0 ]; then
+    confirm "代理 $url 不通（Clash Verge 没在运行，或者节点连不上）。现在启动 Spotify 会完全连不上网。" || exit 0
   fi
 
   if [ "$action" = restart ] && ! quit_spotify; then
