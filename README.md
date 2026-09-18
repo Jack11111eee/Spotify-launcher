@@ -17,7 +17,9 @@ open -a Spotify --args --proxy-server=http://127.0.0.1:59062
 ./build.sh ~/Applications   # 或指定目录
 ```
 
-生成 `/Applications/Spotify (代理).app`。
+生成 `/Applications/Spotify (代理).app`。目标目录不存在或不可写时，会自动改装到 `~/Applications`。
+
+App 由 `osacompile` 生成后再拷入 `launcher.sh` 和图标，这会让 `osacompile` 的签名失效，所以构建的最后会重新做一次 ad-hoc 签名。不重签的话平时也能跑，但 App 一旦带上 quarantine 属性（AirDrop 过来、从压缩包解压）就会被 Gatekeeper 报成「已损坏」。
 
 ### 图标
 
@@ -30,7 +32,7 @@ python3 icon/make_icon.py     # 生成 icon/SpotifyProxy.icns
 
 网格不是照抄模板，是量出来的：把 Spotify 图标的 alpha 通道和超椭圆做拟合，`n=5.0` 时 IoU 0.9952，图形主体 824/1024、四周留白 100px。徽标按档位单独调——大尺寸画得出绕行箭头，小尺寸留不住细节就退化成纯圆点，16px 干脆不加，因为那个尺寸下任何徽标都会糊成像是渲染瑕疵的黑点。
 
-生成的 `.icns` 不会提交（底图是 Spotify 的美术资源），随时可以重新生成。
+生成的 `.icns` 不会提交，也不该提交或分发：底图是 Spotify 的美术资源，把它（哪怕改过）放进公开仓库会有版权和商标问题。图标只在你自己的机器上、用你自己装的 Spotify 现生成现用。
 
 ## 使用
 
@@ -54,6 +56,13 @@ python3 icon/make_icon.py     # 生成 icon/SpotifyProxy.icns
 
 > **首次重启 Spotify 时** macOS 会弹一次「"Spotify (代理)" 想要控制 "Spotify"」，需要点允许（系统设置 → 隐私与安全性 → 自动化）。
 > 如果拒绝了这个授权，启动器就没法正常退出 Spotify，每次重启都会卡到超时兜底路径。
+
+### 会弹窗的两种情况
+
+- **代理不通，但 Spotify 没在运行**：会先问一句要不要继续。继续也能启动，只是 Spotify 完全连不上网，所以默认按钮是「取消」。
+- **Spotify 在运行、参数也对，但代理不通**（第四态）：不重启（重启也连不上），直接提示先把 Clash Verge 弄通。
+
+同一份提示在终端里跑时不会弹窗，而是打印到 stderr —— 启动器靠 `[ -t 1 ]` 判断自己是终端调用还是 App 调用。
 
 也可以在终端直接跑，方便排查：
 
@@ -117,8 +126,10 @@ for c in sp: print('  ', c['metadata'].get('host'), '->', c.get('chains'))
 
 ## 排错
 
-启动器出错会写日志（正常情况下是空的）：
+双击 App 时，`launcher.sh` 的 stderr 会被 App 外壳重定向到日志里（正常情况下是空的）：
 
 ```bash
 cat ~/Library/Logs/SpotifyLauncher.log
 ```
+
+直接跑 `./launcher.sh` 时不会写这个文件，输出就在终端里。
