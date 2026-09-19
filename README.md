@@ -54,7 +54,7 @@ python3 icon/make_icon.py     # 生成 icon/SpotifyProxy.icns
 
 最后一条状态是防御性的：光看命令行参数看不出连接是不是真的还在，所以启动器会去查 Spotify 的网络子进程是不是还连着代理端口，没连着就重启一次。
 
-**但它治不了「歌变灰」。** 实测过灰屏现场：Spotify 一直连着代理（`sp_conn` 7~15，从未断开）、代理探测也通、mihomo 日志里没有任何错误 —— 界面却灰了，而且重启 Spotify 也修不好。那个故障不在这一层，详见下面的诊断记录。
+**但它治不了「歌变灰」。** 实测过灰屏现场：Spotify 一直连着代理（`sp_conn` 7~15，从未断开）、代理探测也通、mihomo 日志里没有任何错误 —— 界面却灰了，而且重启 Spotify 也修不好。那个故障不在这一层：它是客户端本地那份元数据缓存坏了，修法见下面的诊断记录。
 
 > **首次重启 Spotify 时** macOS 会弹一次「"Spotify (代理)" 想要控制 "Spotify"」，需要点允许（系统设置 → 隐私与安全性 → 自动化）。
 > 如果拒绝了这个授权，启动器就没法正常退出 Spotify，每次重启都会卡到超时兜底路径。
@@ -138,50 +138,79 @@ cat ~/Library/Logs/SpotifyLauncher.log
 
 ### 「歌变灰」的诊断记录
 
-**结论：桌面客户端本地缓存了错误的「不可用」元数据，而且不会自我纠正。跟这个启动器、代理、网络、账号市场都无关。**
+**结论：桌面客户端把曲目的可用性缓存在本地元数据仓 `PersistentCache/Users/<id>/primary.ldb` 里。缓存里那几首被写成「音频不可用」之后，客户端就不再重新问，改渲染成音乐视频（MV）那一版 —— 界面上就是你看到的「灰」。跟这个启动器、代理、网络、账号市场都无关。**
 
-2026-09-18 做了一次完整诊断，最终定位到这一层。
+**修法：彻底退出 Spotify，把 `primary.ldb` 移走（或删掉），再启动。不需要 mitmproxy，实测持久。**
+
+2026-09-18 首次诊断，2026-09-19 复现并定位到文件、验证了修法。
 
 #### 现象
 
-- 桌面版里大量曲目变灰、点不动，点了弹「无法获取此内容」
+- 歌单里大量曲目发灰、点不动，点了弹「无法获取此内容」
 - 起初只是按专辑（《太陽之子》），后来扩散到几乎全部
 - 同一账号、同一代理、同一出口 IP，**网页版 `open.spotify.com` 能正常播放**
-- 当天还伴随一次登录故障（与灰歌无关，见文末）
+- 2026-09-19 复现时的确切样子：artist 行前面多一个 **`▶ MV ·`** 前缀（正常行只有 `周杰倫`），标题同时发灰。见下面的「怎么判断灰没灰」
 
 #### 根因
 
-客户端把曲目的可用性**缓存在本地**，之后用条件请求（`If-None-Match` / `If-Modified-Since`）去校验。服务端返回 `304 Not Modified` 时，它就继续沿用本地那份数据。
+客户端的曲目元数据（含可用性）**按版本缓存在本地**，存在这个 LevelDB 仓里：
 
-**一旦缓存里被写进了「不可用」，它不会再重新问一次。** 重启客户端也没用 —— 缓存是持久化的，重启只是把它读回来。
+```
+~/Library/Application Support/Spotify/PersistentCache/Users/<user-id>/primary.ldb
+```
 
-这也解释了最反常的那个现象：桌面版对灰掉的歌**连请求都不发**（抓包里只有 CORS 预检 `OPTIONS`，没有正式 `GET`）。不是它不想请求，是它认为本地已经有答案了。
+拉取时客户端把「我手上这份是哪个版本」告诉服务端（见下面的「两层缓存」）。服务端认为版本没变就回 `304`，客户端继续用本地那份。
 
-**缓存最初为什么会被写成「不可用」，没有拿到直接证据** —— 坏掉的那份状态在修复过程中被就地覆盖了。最可能的两个方向（均为推测）：某次元数据请求失败（网络抖动 / 5xx / 超时）被当成了「不可用」；或账号状态在那段时间短暂异常，客户端据此缓存了不可用，之后账号恢复却不重取。
+**一旦本地那份被写成「音频不可用」，它不会重新问一次。** 重启客户端也没用 —— 缓存是持久化的，重启只是把它读回来。
+
+客户端对「音频不可用」的处理是**退回该曲目的音乐视频版本**，这就是 `▶ MV ·` 前缀和灰标题的来历。所以「灰」不是渲染故障，是客户端手里那份数据就是错的。
+
+**缓存最初为什么会被写成「不可用」，仍未拿到直接证据**（坏掉的那份在 2026-09-19 已完整存档，见文末）。最可能的两个方向（均为推测）：某次元数据请求失败（网络抖动 / 5xx / 超时）被当成了「不可用」；或账号状态在那段时间短暂异常，客户端据此缓存了不可用，之后账号恢复却不重取。
+
+#### 两层缓存（更正早先的说法）
+
+早先这里把机制写成「`/metadata/4/` 上的条件请求（`If-None-Match` / `If-Modified-Since`）」—— **与现在客户端的行为不符**。2026-09-19 三次完整抓包里，每次会话只有 **1 次** `/metadata/4/track` 请求，客户端根本不靠它。
+
+实际是两层，都用「版本号 + 哈希」而不是 HTTP 条件请求头：
+
+```
+# ① 歌单正文：revision diff
+GET /playlist/v2/playlist/<id>/diff?revision=0,f447085452ce26c4ba2522ef7d0758b821a8c1bd
+→ 304 Not Modified                      # 客户端继续用本地那份歌单
+
+# ② 曲目元数据：请求体里逐条上报本地版本
+POST /extended-metadata/v0/extended-metadata
+  1: country=NG  catalog=premium
+  2: uri=spotify:track:...   { 1: <版本号>, 2: <8 字节哈希> }
+→ 逐条返回 304（用本地那份）或 200（带完整 Track protobuf）
+```
+
+这也解释了早先那个反常现象：桌面版对灰掉的歌**连请求都不发** —— 它认为自己本地已经有答案了。
+
+> 想靠改写请求来逼它刷新是走不通的：把 `revision=` 摘掉、或把上报的版本删掉，服务端都直接回 **`400`**（实测 21/21 和 22 次请求全部 400）。这两个参数是必填的。**正解是清本地那份，不是改请求。**
 
 #### 怎么定位到的
 
-把 mitmproxy 串在 Clash 前面，并在插件里**摘掉 `/metadata/4/` 请求上的条件请求头**，逼服务端返回完整的 `200` 而不是 `304`。桌面版当场恢复：
+1. **先整份备份坏状态**（早先那次没来得及，坏状态被就地覆盖了）。这次在动手前把 `PersistentCache/` 整份存了下来。
+2. 用 `spotify:playlist:<id>` 之类的方式把出问题的歌单调出来截图，确认 `▶ MV ·` 前缀。
+3. 试出「彻底退出 Spotify → 移走 `primary.ldb` → 重启」，MV 前缀消失、标题恢复。
+4. **反向验证因果**：把坏的那份 `primary.ldb` 放回去、重启 —— `▶ MV ·` **立刻整片复现**（同一张截图里，第 1~8 行是 `▶ MV · 周杰倫`，第 9~10 行是正常的 `周杰倫`）。再换回干净的那份，恢复正常。
 
-```
-22:48:56  desktop  GET   /metadata/4/track/...                    200
-22:48:56  desktop  GET   /storage-resolve/v2/files/audio/...      200
-22:48:56  desktop  POST  /playplay/v1/key/...                     200
-22:48:57  desktop  206   audio4-fa.scdn.co/audio/...          3145728B
-22:49:04  desktop  206   audio4-fa.scdn.co/audio/...          4550832B
-```
-
-随后把 mitmproxy 撤掉、用 `./launcher.sh` 恢复正常启动，**依然正常** —— 证明坏的就是那份缓存，刷新一次即可，不需要常驻中间层。
+第 4 步是关键：它把「坏状态就在这个文件里」从推测变成了对照实验。
 
 #### 试过的办法
 
 | 办法 | 结果 | 原因 |
 |---|---|---|
 | 重启客户端 | 无效 | 缓存持久化，重启只是读回来 |
-| 清 `~/Library/Caches/com.spotify.client/`（700MB） | 无效 | 曲目元数据不在那儿（清掉后灰歌依旧） |
+| 清 `~/Library/Caches/com.spotify.client/`（700MB） | 无效 | 曲目元数据不在那儿 |
 | 换出口节点（两个不同的美国节点） | 无效 | 与网络层无关 |
 | 退出登录 → 重新登录 | **有害** | 与缓存是两回事，而且会把客户端卡在登录页（见文末） |
-| 移走 `Application Support/Spotify/PersistentCache/` | 无效 | 灰歌依旧。**但早先「它有害」的判断是错的**，见下面的「两处被证伪的结论」 |
+| 移走 `PersistentCache/`（**在 Spotify 运行时**） | 无效 | 进程开着 LevelDB，移动目录既不清内存状态也不清它已打开的文件，退出时还会把旧内容写回去。**必须先彻底退出再移** |
+| **移走 `primary.ldb`（彻底退出后）** | **有效** | 正解，见上 |
+| 摘掉 `/playlist/v2/.../diff` 的 `revision=` 参数 | 无效 | 服务端回 `400`，该参数必填 |
+| 删掉 extended-metadata 请求体里上报的版本 | 无效 | 服务端回 `400`，该字段必填 |
+| 把上报的版本号清零（保留字段） | 无效 | 服务端照回 `200` 完整元数据，界面仍灰 —— 说明刷新元数据**不等于**清掉可用性判定 |
 
 #### 已排除的层面
 
@@ -192,10 +221,16 @@ cat ~/Library/Logs/SpotifyLauncher.log
 | DRM | 正常 | `widevine-license` 返回 `200` |
 | 服务端授权 / 市场 | 排除 | `metadata/4/track` 在 `from_token/NG/US/TW/JP/HK` **六个市场全部 200**，带完整 `original_audio` 句柄和封面 |
 | 发行时间门控 | 排除 | `earliest_live_timestamp` 早已过去 |
-| Chromium HTTP 缓存 | 排除 | `~/Library/Caches/com.spotify.client/` 里没有任何相关条目，清掉也没用。坏的是**另一份**缓存（见上面的「根因」） |
+| Chromium HTTP 缓存 | 排除 | `~/Library/Caches/com.spotify.client/` 里没有任何相关条目，清掉也没用 |
 | `ap-*.spotify.com` 不可达 | **无关** | 这批接入点在全球范围内都已下线（6 个国家的探测点，80/443 全部超时），但客户端根本不用它们 —— 它走 `guc3-spclient` / `dealer` |
 
 顺带一条：启动器的第五态（没连着代理就重启）**在这个故障里永远不会触发** —— Spotify 从头到尾都连着代理，重启也修不好。
+
+#### 怎么判断灰没灰（一条测量教训）
+
+**别用标题的像素亮度判断。** 小字号抗锯齿会让最大像素值偏低，量出来「已点赞的歌曲」这种确定可播放的列表，标题峰值也是同样的 **113**（大标题是 255）—— 跟灰掉的那张歌单数值一模一样，区分不出来。这条弯路走过一次，白花了不少时间。
+
+可靠的判据是**结构性的**：artist 行前面有没有 **`▶ MV ·`** 前缀。有就是退回了音乐视频版本（即「灰」），没有就是正常曲目行。分类信号比像素值可靠得多。
 
 #### 两处被证伪的结论
 
@@ -206,14 +241,26 @@ cat ~/Library/Logs/SpotifyLauncher.log
 
 #### 下次再犯怎么办
 
-**已知有效的办法**就是上面那条：把 mitmproxy 串上去，在插件里摘掉 `/metadata/4/` 的条件请求头，让它重新拉一次。刷一次之后就可以撤掉 mitmproxy，用 `./launcher.sh` 恢复正常启动 —— 实测刷新是持久的，不需要常驻中间层。
+**彻底退出 Spotify，把 `primary.ldb` 移走，再启动。** 实测持久，不需要 mitmproxy，也不需要常驻任何中间层。
 
-**还没找到不依赖 mitmproxy 的等效办法。** 试过的两条都不行：
+```bash
+osascript -e 'tell application "Spotify" to quit'; sleep 5; pkill -x Spotify
+U="$HOME/Library/Application Support/Spotify/PersistentCache/Users/<user-id>"
+mv "$U/primary.ldb" "$U/primary.ldb.bak-$(date +%Y%m%d-%H%M%S)"   # 建议留一份，别直接删
+./launcher.sh
+```
 
-- 清 `~/Library/Caches/com.spotify.client/`（700MB）→ 无效
-- 移走 `Application Support/Spotify/PersistentCache/` → 无效
+`<user-id>` 是 `Users/` 下唯一那个目录名。**退出一定要退干净**：`pkill -x Spotify` 之后再确认一次 `pgrep -x Spotify` 没有输出，否则等于没移。
 
-也就是说，那份坏掉的曲目可用性缓存**具体落在哪个文件里，目前还不清楚**。下次复现时**先把坏掉的状态整份备份下来再动手修**（这次没来得及，坏状态在修复过程中被就地覆盖了），两相对照就能定位到文件。
+挪走之后客户端会重建一份干净的，歌单、点赞、播放记录都不受影响（只丢本地元数据缓存，会重新拉一遍）。
+
+**坏掉的那份已经存档**，下次要对照可以直接拿：
+
+```
+~/Library/Logs/spotify-grey-backup-20260919-181329/
+  primary.ldb.BROKEN-confirmed     # 就是它，放回去就能复现
+  PersistentCache/  prefs  Users/  # 2026-09-19 动手前的整份现场
+```
 
 #### 附：同一天遇到的登录故障（与灰歌无关）
 
@@ -234,16 +281,20 @@ open -a Spotify --args "--proxy-server=http://127.0.0.1:8888" "--ignore-certific
 
 `--ignore-certificate-errors` 是这里的关键：Spotify 是 CEF 内核，这个 Chromium 开关让它直接接受 mitmproxy 的自签证书，**不需要往系统钥匙串装 CA**，全程不改 macOS 系统设置。测完退出 Spotify，用 `./launcher.sh` 重新拉起即可回到正常方式。
 
-**这个故障就藏在一个细节里**：默认抓包看到的是一片 `304 Not Modified`，看上去「一切正常」。要看到真相，得在插件里把 `/metadata/4/` 请求上的条件请求头摘掉，逼服务端返回完整正文：
+**这个故障就藏在一个细节里**：默认抓包看到的是一片 `304 Not Modified`，看上去「一切正常」。要在插件里把 304 和请求体里的版本号打出来，才看得见「客户端一直在拿 304、一直在用本地那份错数据」：
 
 ```python
+# extended-metadata 的请求体里逐条带着客户端本地版本，是判断「它凭什么拿 304」的关键
 def request(flow):
-    if "/metadata/4/" in flow.request.path:
-        for h in ("if-none-match", "if-modified-since"):
-            flow.request.headers.pop(h, None)
+    if "extended-metadata" in flow.request.pretty_host:
+        open("/tmp/extmd.req", "wb").write(flow.request.content or b"")
+
+def response(flow):
+    print(flow.request.pretty_host, flow.request.path,
+          flow.response.status_code, flow.client_conn.peername)
 ```
 
-摘掉之后客户端立刻恢复播放 —— **「摘掉就好」本身就是诊断结论**：它一直在拿 304、一直在用本地那份错数据。
+> 别指望靠改请求来修：`revision=` 和上报的版本号都是必填，摘掉就 `400`（见上面的「两层缓存」）。抓包在这里的用途是**看清机制**，修法是清本地那份 `primary.ldb`。
 
 另一个识别技巧：日志里带上客户端源端口，再用 `lsof -nP -iTCP` 把端口对回进程，就能分清哪条请求来自桌面版、哪条来自浏览器 —— 两者都会请求 `spclient` / `pathfinder`，光看主机名分不开。
 
