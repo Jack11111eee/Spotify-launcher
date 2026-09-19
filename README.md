@@ -138,9 +138,16 @@ cat ~/Library/Logs/SpotifyLauncher.log
 
 ### 「歌变灰」的诊断记录
 
-**结论：桌面客户端把曲目的可用性缓存在本地元数据仓 `PersistentCache/Users/<id>/primary.ldb` 里。缓存里那几首被写成「音频不可用」之后，客户端就不再重新问，改渲染成音乐视频（MV）那一版 —— 界面上就是你看到的「灰」。跟这个启动器、代理、网络、账号市场都无关。**
+**结论（2026-09-19 更新，仍未定论）：**
 
-**修法：彻底退出 Spotify，把 `primary.ldb` 移走（或删掉），再启动。不需要 mitmproxy，实测持久。**
+- 灰掉的曲目在桌面版里**确实不能播**，客户端对它们**连播放请求都不发**。
+- 清掉 `primary.ldb` **只会改变渲染**（`▶ MV ·` 前缀消失），**并不会恢复播放**。所以「可用性判定存在这个文件里」这个说法**已被证伪**。
+- 服务端侧看起来是好的：歌单正文只含 114 个曲目 URI（不含可用性字段）；对真实曲目（`太陽之子` / `那天下雨了` / `擱淺`）取 `metadata/4/track`，在 `NG / US / TW / JP / GB / from_token` **六个市场全部 200**，都带 audio 句柄。
+- **根因尚未定位。** 剩下的方向：可用性状态缓存在别的本地文件里（`public.ldb` / `Users/<id>/cached`，未验证），或者根本是账号/市场层面的授权。
+
+**注意：整份移走 `PersistentCache` 会把客户端登出** —— 登录态确实存在那里面（`prefs` 里的 `autologin.*` 不足以恢复）。要试必须先备份，且做好重新登录的准备。
+
+以下保留 2026-09-18 / 09-19 的原始记录，其中**「修法」一节已作废**，只留作过程参考。
 
 2026-09-18 首次诊断，2026-09-19 复现并定位到文件、验证了修法。
 
@@ -241,20 +248,16 @@ POST /extended-metadata/v0/extended-metadata
 
 #### 下次再犯怎么办
 
-**彻底退出 Spotify，把 `primary.ldb` 移走，再启动。** 实测持久，不需要 mitmproxy，也不需要常驻任何中间层。
+**目前没有已知有效的办法。** 上面那版「清 `primary.ldb`」是错的（只改渲染，不改播放），已作废。
 
-```bash
-osascript -e 'tell application "Spotify" to quit'; sleep 5; pkill -x Spotify
-U="$HOME/Library/Application Support/Spotify/PersistentCache/Users/<user-id>"
-mv "$U/primary.ldb" "$U/primary.ldb.bak-$(date +%Y%m%d-%H%M%S)"   # 建议留一份，别直接删
-./launcher.sh
-```
+已排除的：清 `~/Library/Caches/com.spotify.client/`、清 `primary.ldb`、换节点、强制服务端返回完整元数据（把 extended-metadata 上报的版本号清零 → 服务端照回 200，界面照样灰）。
 
-`<user-id>` 是 `Users/` 下唯一那个目录名。**退出一定要退干净**：`pkill -x Spotify` 之后再确认一次 `pgrep -x Spotify` 没有输出，否则等于没移。
+**下一步该试的**（都需要先备份，且注意 `PersistentCache` 含登录态）：
 
-挪走之后客户端会重建一份干净的，歌单、点赞、播放记录都不受影响（只丢本地元数据缓存，会重新拉一遍）。
+1. 在网页版 `open.spotify.com` 上打开同一张歌单 —— 能播就说明是客户端侧，不能播就是账号/市场侧。这一步最便宜，应该先做。
+2. 若是客户端侧，再逐个试 `public.ldb`、`Users/<id>/cached`。
 
-**坏掉的那份已经存档**，下次要对照可以直接拿：
+坏掉的那份已存档，放回去可以复现渲染层面的 `▶ MV ·`（但复现不了/修不好播放，见上）：
 
 ```
 ~/Library/Logs/spotify-grey-backup-20260919-181329/
